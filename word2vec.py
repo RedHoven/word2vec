@@ -1,8 +1,12 @@
-# Implemented according to the original papers:
+# Pure NumPy implementation of Skip-Gram with Negative Sampling (SGNS)
+# inspired by Mikolov et al. (2013). 
+# Optimizations include batch processing and learning rate scheduling for improved training efficiency and convergence.
+#
 # - "Efficient Estimation of Word Representations in Vector Space" (Mikolov et al., 2013)
 # - "Distributed Representations of Words and Phrases and their Compositionality" (Mikolov et al., 2013)
-# with batch processing and learning rate scheduling for improved training efficiency and convergence.
 
+import time
+import os
 import numpy as np
 import re
 from collections import Counter
@@ -93,12 +97,23 @@ def sample_training_pair(token_indices, window_size):
 
     return center_word_idx, context_word_idx
 
-def sample_negative_examples(neg_sampling_table, num_samples):
+def sample_negative_examples(neg_sampling_table, num_samples, exclude_indices=None):
     """
     Sample negative examples from the negative sampling table.
+    Filters out any indices that should be excluded.
     """
-    random_indices = np.random.randint(0, len(neg_sampling_table), size=num_samples)
-    return neg_sampling_table[random_indices]
+    if exclude_indices is None:
+        exclude_indices = set()
+    else:
+        exclude_indices = set(exclude_indices)
+    
+    negatives = []
+    while len(negatives) < num_samples:
+        candidate = neg_sampling_table[np.random.randint(0, len(neg_sampling_table))]
+        if candidate not in exclude_indices:
+            negatives.append(candidate)
+    
+    return np.array(negatives, dtype=np.int32)
 
 def sample_training_batch(token_indices, window_size, batch_size, neg_sampling_table, num_negatives):
     """
@@ -110,7 +125,8 @@ def sample_training_batch(token_indices, window_size, batch_size, neg_sampling_t
     
     for i in range(batch_size):
         center_indices[i], context_indices[i] = sample_training_pair(token_indices, window_size)
-        negative_indices[i] = sample_negative_examples(neg_sampling_table, num_negatives)
+        exclude_indices = [center_indices[i], context_indices[i]]
+        negative_indices[i] = sample_negative_examples(neg_sampling_table, num_negatives, exclude_indices=exclude_indices)
     
     # Dims:
     # center_indices: (batch_size,)
@@ -126,22 +142,24 @@ def compute_batch_loss_and_gradients(U, V, center_indices, context_indices, nega
     v_pos = V[context_indices]      # (batch_size, embedding_dim)
     v_neg = V[negative_indices]     # (batch_size, num_negatives, embedding_dim)
     
-    # Compute positive scores (batch_size,)
+    # (batch_size,)
     pos_scores = np.sum(v_pos * u, axis=1) 
     
-    # Compute negative scores (batch_size, num_negatives)
+    # (batch_size, num_negatives)
     neg_scores = np.sum(v_neg * u[:, np.newaxis, :], axis=2)
     
-    # Compute loss (batch_size,)
-    pos_loss = -np.sum(np.log(sigmoid(pos_scores) + 1e-10))
-    neg_loss = -np.sum(np.log(sigmoid(-neg_scores) + 1e-10))
-    total_loss = pos_loss + neg_loss
+    pos_sig = sigmoid(pos_scores)
+    pos_loss = -np.sum(np.log(pos_sig + 1e-10))
+    
+    neg_sig = sigmoid(neg_scores)
+    neg_loss = -np.sum(np.log(1 - neg_sig + 1e-10))
+
+    total_loss = (pos_loss + neg_loss) / BATCH_SIZE
     
     # Gradient for center embeddings (batch_size, embedding_dim)
-    pos_grad_factor = (sigmoid(pos_scores) - 1)[:, np.newaxis]
+    pos_grad_factor = (pos_sig - 1)[:, np.newaxis]
     grad_U = pos_grad_factor * v_pos
-
-    neg_grad_factor = sigmoid(neg_scores)[:, :, np.newaxis]
+    neg_grad_factor = neg_sig[:, :, np.newaxis]
     grad_U += np.sum(neg_grad_factor * v_neg, axis=1)
     
     # Gradient for positive context embeddings (batch_size, embedding_dim)
@@ -170,7 +188,7 @@ def update_embeddings_batch(U, V, center_indices, context_indices, negative_indi
     grad_V_neg_flat = grad_V_neg.reshape(-1, grad_V_neg.shape[-1])
     np.add.at(V, neg_indices_flat, -lr * grad_V_neg_flat)
 
-def build_negative_sampling_table(vocab, table_size=int(1e8)):
+def build_negative_sampling_table(vocab, table_size=int(1e7)):
     """Build negative sampling table for efficient sampling"""
     print("Building negative sampling table...")
     words = list(vocab.keys())
@@ -196,38 +214,28 @@ def build_negative_sampling_table(vocab, table_size=int(1e8)):
 def train_word2vec(filename):
     """Main training function"""
     
-    # Data loading and preprocessing
     tokens = load_and_tokenize(filename)
     vocab, word2idx, idx2word = build_vocabulary(tokens, MIN_COUNT)
     vocab_size = len(vocab)
     
     tokens = subsample_tokens(tokens, word2idx, vocab, SUBSAMPLING_THRESHOLD)
     token_indices = [word2idx[token] for token in tokens]
-    
-    # Build negative sampling table
     neg_sampling_table = build_negative_sampling_table(vocab)
     
-    # Initialize embeddings
     print("Initializing embeddings...")
     U = (np.random.rand(vocab_size, EMBEDDING_DIM) - 0.5) / np.sqrt(EMBEDDING_DIM)
     V = (np.random.rand(vocab_size, EMBEDDING_DIM) - 0.5) / np.sqrt(EMBEDDING_DIM)
     
     print("Training...")
-    # Calculate total number of training steps
-    num_positions = len(token_indices) - 2 * WINDOW_SIZE
-    num_batches = num_positions // BATCH_SIZE
+    num_batches = len(token_indices) // BATCH_SIZE
     total_steps = num_batches * EPOCHS
-    
-    # Open log file for training metrics
-    import time
-    import os
+
     os.makedirs("artifacts", exist_ok=True)
     log_filename = f"artifacts/training_log_{int(time.time())}.csv"
     log_file = open(log_filename, 'w')
     log_file.write("epoch,batch,total_batches,loss,avg_loss,learning_rate\n")
     print(f"Logging training metrics to {log_filename}")
     
-    # Training loop
     for epoch in range(EPOCHS):
         print(f"\nEpoch {epoch + 1}/{EPOCHS}")
         total_loss = 0
@@ -296,7 +304,6 @@ if __name__ == "__main__":
     if args.train:
         U, V, word2idx, idx2word = train_word2vec("wiki-data-small.txt")
         
-        # Save embeddings and vocabulary
         print("\nSaving embeddings...")
         np.save("artifacts/word_embeddings_U.npy", U)
         np.save("artifacts/word_embeddings_V.npy", V)
